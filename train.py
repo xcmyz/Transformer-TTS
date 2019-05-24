@@ -1,293 +1,179 @@
-'''
-This script handling the training process.
-'''
-
-import argparse
-import math
-import time
-
-from tqdm import tqdm
 import torch
-import torch.nn.functional as F
-import torch.optim as optim
-import torch.utils.data
-import transformer.Constants as Constants
-from dataset import TranslationDataset, paired_collate_fn
-from transformer.Models import Transformer
-from transformer.Optim import ScheduledOptim
+import torch.nn as nn
 
-def cal_performance(pred, gold, smoothing=False):
-    ''' Apply label smoothing if needed '''
+from multiprocessing import cpu_count
+import numpy as np
+import argparse
+import os
+import time
+import math
 
-    loss = cal_loss(pred, gold, smoothing)
-
-    pred = pred.max(1)[1]
-    gold = gold.contiguous().view(-1)
-    non_pad_mask = gold.ne(Constants.PAD)
-    n_correct = pred.eq(gold)
-    n_correct = n_correct.masked_select(non_pad_mask).sum().item()
-
-    return loss, n_correct
+from transformer.Models import TransformerTTS
+from loss import TransformerTTSLoss
+from data_utils import TransformerTTSDataLoader, collate_fn, DataLoader
+import hparams as hp
 
 
-def cal_loss(pred, gold, smoothing):
-    ''' Calculate cross entropy loss, apply label smoothing if needed. '''
+def main(args):
+    # Get device
+    device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
 
-    gold = gold.contiguous().view(-1)
+    # Define model
+    model = nn.DataParallel(TransformerTTS()).to(device)
+    print("Model Has Been Defined")
 
-    if smoothing:
-        eps = 0.1
-        n_class = pred.size(1)
+    # Get dataset
+    dataset = TransformerTTSDataLoader()
 
-        one_hot = torch.zeros_like(pred).scatter(1, gold.view(-1, 1), 1)
-        one_hot = one_hot * (1 - eps) + (1 - one_hot) * eps / (n_class - 1)
-        log_prb = F.log_softmax(pred, dim=1)
+    # Optimizer and loss
+    optimizer = torch.optim.Adam(model.parameters(), lr=hp.learning_rate)
+    transformer_loss = TransformerTTSLoss().to(device)
 
-        non_pad_mask = gold.ne(Constants.PAD)
-        loss = -(one_hot * log_prb).sum(dim=1)
-        loss = loss.masked_select(non_pad_mask).sum()  # average later
-    else:
-        loss = F.cross_entropy(pred, gold, ignore_index=Constants.PAD, reduction='sum')
+    # Get training loader
+    print("Get Training Loader")
+    training_loader = DataLoader(dataset, batch_size=hp.batch_size, shuffle=True,
+                                 collate_fn=collate_fn, drop_last=True, num_workers=cpu_count())
 
-    return loss
+    try:
+        checkpoint = torch.load(os.path.join(
+            hp.checkpoint_path, 'checkpoint_%d.pth.tar' % args.restore_step))
+        model.load_state_dict(checkpoint['model'])
+        optimizer.load_state_dict(checkpoint['optimizer'])
+        print("---Model Restored at Step %d---\n" % args.restore_step)
+
+    except:
+        print("---Start New Training---\n")
+        if not os.path.exists(hp.checkpoint_path):
+            os.mkdir(hp.checkpoint_path)
+
+    # Init logger
+    if not os.path.exists("logger"):
+        os.mkdir("logger")
+
+    # Training
+    model = model.train()
+
+    total_step = hp.epochs * len(training_loader)
+    Time = np.array(list())
+    Start = time.clock()
+
+    for epoch in range(hp.epochs):
+        for i, data_of_batch in enumerate(training_loader):
+            start_time = time.clock()
+
+            current_step = i + args.restore_step + \
+                epoch * len(training_loader) + 1
+
+            # Init
+            optimizer.zero_grad()
+
+            # Prepare Data
+            src_seq = data_of_batch["texts"]
+            src_pos = data_of_batch["pos_padded"]
+            tgt_seq = data_of_batch["tgt_sep"]
+            tgt_pos = data_of_batch["tgt_pos"]
+            mel_tgt = data_of_batch["mels"]
+            gate_target = data_of_batch["gate_target"]
+
+            src_seq = torch.from_numpy(src_seq).long().to(device)
+            src_pos = torch.from_numpy(src_pos).long().to(device)
+            tgt_seq = torch.from_numpy(tgt_seq).long().to(device)
+            tgt_pos = torch.from_numpy(tgt_pos).long().to(device)
+            mel_tgt = torch.from_numpy(mel_tgt).float().to(device)
+            gate_target = torch.from_numpy(gate_target).float().to(device)
+
+            # Forward
+            mel_output, mel_output_postnet, stop_token = model(
+                src_seq, src_pos, tgt_seq, tgt_pos, mel_tgt)
+
+            # Cal Loss
+            mel_loss, mel_postnet_loss, gate_loss = transformer_loss(
+                mel_output, mel_output_postnet, stop_token, mel_tgt, gate_target)
+            total_mel_loss = mel_loss + mel_postnet_loss
+            total_loss = total_mel_loss + gate_loss
+
+            # Logger
+            t_m_l = total_mel_loss.item()
+            m_l = mel_loss.item()
+            m_p_l = mel_postnet_loss.item()
+            g_l = gate_loss.item()
+
+            with open(os.path.join("logger", "total_mel_loss.txt"), "a") as f_total_loss:
+                f_total_loss.write(str(t_m_l)+"\n")
+
+            with open(os.path.join("logger", "mel_loss.txt"), "a") as f_mel_loss:
+                f_mel_loss.write(str(m_l)+"\n")
+
+            with open(os.path.join("logger", "mel_postnet_loss.txt"), "a") as f_mel_postnet_loss:
+                f_mel_postnet_loss.write(str(m_p_l)+"\n")
+
+            with open(os.path.join("logger", "gate_loss.txt"), "a") as f_gate_loss:
+                f_gate_loss.write(str(g_l)+"\n")
+
+            # Backward
+            total_loss.backward()
+
+            # Clipping gradients to avoid gradient explosion
+            nn.utils.clip_grad_norm_(model.parameters(), hp.grad_clip_thresh)
+
+            # Update weights
+            optimizer.step()
+
+            # Print
+            if current_step % hp.log_step == 0:
+                Now = time.clock()
+
+                str1 = "Epoch [{}/{}], Step [{}/{}], Mel Loss: {:.4f}, Mel PostNet Loss: {:.4f}, Gate Loss: {:.4f}, Total Loss: {:.4f}.".format(
+                    epoch+1, hp.epochs, current_step, total_step, mel_loss.item(), mel_postnet_loss.item(), gate_loss.item(), total_loss.item())
+                str2 = "Time Used: {:.3f}s, Estimated Time Remaining: {:.3f}s.".format(
+                    (Now-Start), (total_step-current_step)*np.mean(Time))
+
+                print(str1)
+                print(str2)
+
+                with open(os.path.join("logger", "logger.txt"), "a") as f_logger:
+                    f_logger.write(str1 + "\n")
+                    f_logger.write(str2 + "\n")
+                    f_logger.write("\n")
+
+            if current_step % hp.save_step == 0:
+                torch.save({'model': model.state_dict(), 'optimizer': optimizer.state_dict(
+                )}, os.path.join(hp.checkpoint_path, 'checkpoint_%d.pth.tar' % current_step))
+                print("save model at step %d ..." % current_step)
+
+            if current_step in hp.decay_step:
+                optimizer = adjust_learning_rate(optimizer, current_step)
+
+            end_time = time.clock()
+            Time = np.append(Time, end_time - start_time)
+            if len(Time) == hp.clear_Time:
+                temp_value = np.mean(Time)
+                Time = np.delete(
+                    Time, [i for i in range(len(Time))], axis=None)
+                Time = np.append(Time, temp_value)
 
 
-def train_epoch(model, training_data, optimizer, device, smoothing):
-    ''' Epoch operation in training phase'''
+def adjust_learning_rate(optimizer, step):
+    if step == hp.decay_step[0]:
+        for param_group in optimizer.param_groups:
+            param_group['lr'] = 0.0005
 
-    model.train()
+    elif step == hp.decay_step[1]:
+        for param_group in optimizer.param_groups:
+            param_group['lr'] = 0.0003
 
-    total_loss = 0
-    n_word_total = 0
-    n_word_correct = 0
+    elif step == hp.decay_step[2]:
+        for param_group in optimizer.param_groups:
+            param_group['lr'] = 0.0001
 
-    for batch in tqdm(
-            training_data, mininterval=2,
-            desc='  - (Training)   ', leave=False):
+    return optimizer
 
-        # prepare data
-        src_seq, src_pos, tgt_seq, tgt_pos = map(lambda x: x.to(device), batch)
-        gold = tgt_seq[:, 1:]
 
-        # forward
-        optimizer.zero_grad()
-        pred = model(src_seq, src_pos, tgt_seq, tgt_pos)
-
-        # backward
-        loss, n_correct = cal_performance(pred, gold, smoothing=smoothing)
-        loss.backward()
-
-        # update parameters
-        optimizer.step_and_update_lr()
-
-        # note keeping
-        total_loss += loss.item()
-
-        non_pad_mask = gold.ne(Constants.PAD)
-        n_word = non_pad_mask.sum().item()
-        n_word_total += n_word
-        n_word_correct += n_correct
-
-    loss_per_word = total_loss/n_word_total
-    accuracy = n_word_correct/n_word_total
-    return loss_per_word, accuracy
-
-def eval_epoch(model, validation_data, device):
-    ''' Epoch operation in evaluation phase '''
-
-    model.eval()
-
-    total_loss = 0
-    n_word_total = 0
-    n_word_correct = 0
-
-    with torch.no_grad():
-        for batch in tqdm(
-                validation_data, mininterval=2,
-                desc='  - (Validation) ', leave=False):
-
-            # prepare data
-            src_seq, src_pos, tgt_seq, tgt_pos = map(lambda x: x.to(device), batch)
-            gold = tgt_seq[:, 1:]
-
-            # forward
-            pred = model(src_seq, src_pos, tgt_seq, tgt_pos)
-            loss, n_correct = cal_performance(pred, gold, smoothing=False)
-
-            # note keeping
-            total_loss += loss.item()
-
-            non_pad_mask = gold.ne(Constants.PAD)
-            n_word = non_pad_mask.sum().item()
-            n_word_total += n_word
-            n_word_correct += n_correct
-
-    loss_per_word = total_loss/n_word_total
-    accuracy = n_word_correct/n_word_total
-    return loss_per_word, accuracy
-
-def train(model, training_data, validation_data, optimizer, device, opt):
-    ''' Start training '''
-
-    log_train_file = None
-    log_valid_file = None
-
-    if opt.log:
-        log_train_file = opt.log + '.train.log'
-        log_valid_file = opt.log + '.valid.log'
-
-        print('[Info] Training performance will be written to file: {} and {}'.format(
-            log_train_file, log_valid_file))
-
-        with open(log_train_file, 'w') as log_tf, open(log_valid_file, 'w') as log_vf:
-            log_tf.write('epoch,loss,ppl,accuracy\n')
-            log_vf.write('epoch,loss,ppl,accuracy\n')
-
-    valid_accus = []
-    for epoch_i in range(opt.epoch):
-        print('[ Epoch', epoch_i, ']')
-
-        start = time.time()
-        train_loss, train_accu = train_epoch(
-            model, training_data, optimizer, device, smoothing=opt.label_smoothing)
-        print('  - (Training)   ppl: {ppl: 8.5f}, accuracy: {accu:3.3f} %, '\
-              'elapse: {elapse:3.3f} min'.format(
-                  ppl=math.exp(min(train_loss, 100)), accu=100*train_accu,
-                  elapse=(time.time()-start)/60))
-
-        start = time.time()
-        valid_loss, valid_accu = eval_epoch(model, validation_data, device)
-        print('  - (Validation) ppl: {ppl: 8.5f}, accuracy: {accu:3.3f} %, '\
-                'elapse: {elapse:3.3f} min'.format(
-                    ppl=math.exp(min(valid_loss, 100)), accu=100*valid_accu,
-                    elapse=(time.time()-start)/60))
-
-        valid_accus += [valid_accu]
-
-        model_state_dict = model.state_dict()
-        checkpoint = {
-            'model': model_state_dict,
-            'settings': opt,
-            'epoch': epoch_i}
-
-        if opt.save_model:
-            if opt.save_mode == 'all':
-                model_name = opt.save_model + '_accu_{accu:3.3f}.chkpt'.format(accu=100*valid_accu)
-                torch.save(checkpoint, model_name)
-            elif opt.save_mode == 'best':
-                model_name = opt.save_model + '.chkpt'
-                if valid_accu >= max(valid_accus):
-                    torch.save(checkpoint, model_name)
-                    print('    - [Info] The checkpoint file has been updated.')
-
-        if log_train_file and log_valid_file:
-            with open(log_train_file, 'a') as log_tf, open(log_valid_file, 'a') as log_vf:
-                log_tf.write('{epoch},{loss: 8.5f},{ppl: 8.5f},{accu:3.3f}\n'.format(
-                    epoch=epoch_i, loss=train_loss,
-                    ppl=math.exp(min(train_loss, 100)), accu=100*train_accu))
-                log_vf.write('{epoch},{loss: 8.5f},{ppl: 8.5f},{accu:3.3f}\n'.format(
-                    epoch=epoch_i, loss=valid_loss,
-                    ppl=math.exp(min(valid_loss, 100)), accu=100*valid_accu))
-
-def main():
-    ''' Main function '''
+if __name__ == "__main__":
+    # Main
     parser = argparse.ArgumentParser()
+    parser.add_argument('--restore_step', type=int,
+                        help='checkpoint', default=0)
+    args = parser.parse_args()
 
-    parser.add_argument('-data', required=True)
-
-    parser.add_argument('-epoch', type=int, default=10)
-    parser.add_argument('-batch_size', type=int, default=64)
-
-    #parser.add_argument('-d_word_vec', type=int, default=512)
-    parser.add_argument('-d_model', type=int, default=512)
-    parser.add_argument('-d_inner_hid', type=int, default=2048)
-    parser.add_argument('-d_k', type=int, default=64)
-    parser.add_argument('-d_v', type=int, default=64)
-
-    parser.add_argument('-n_head', type=int, default=8)
-    parser.add_argument('-n_layers', type=int, default=6)
-    parser.add_argument('-n_warmup_steps', type=int, default=4000)
-
-    parser.add_argument('-dropout', type=float, default=0.1)
-    parser.add_argument('-embs_share_weight', action='store_true')
-    parser.add_argument('-proj_share_weight', action='store_true')
-
-    parser.add_argument('-log', default=None)
-    parser.add_argument('-save_model', default=None)
-    parser.add_argument('-save_mode', type=str, choices=['all', 'best'], default='best')
-
-    parser.add_argument('-no_cuda', action='store_true')
-    parser.add_argument('-label_smoothing', action='store_true')
-
-    opt = parser.parse_args()
-    opt.cuda = not opt.no_cuda
-    opt.d_word_vec = opt.d_model
-
-    #========= Loading Dataset =========#
-    data = torch.load(opt.data)
-    opt.max_token_seq_len = data['settings'].max_token_seq_len
-
-    training_data, validation_data = prepare_dataloaders(data, opt)
-
-    opt.src_vocab_size = training_data.dataset.src_vocab_size
-    opt.tgt_vocab_size = training_data.dataset.tgt_vocab_size
-
-    #========= Preparing Model =========#
-    if opt.embs_share_weight:
-        assert training_data.dataset.src_word2idx == training_data.dataset.tgt_word2idx, \
-            'The src/tgt word2idx table are different but asked to share word embedding.'
-
-    print(opt)
-
-    device = torch.device('cuda' if opt.cuda else 'cpu')
-    transformer = Transformer(
-        opt.src_vocab_size,
-        opt.tgt_vocab_size,
-        opt.max_token_seq_len,
-        tgt_emb_prj_weight_sharing=opt.proj_share_weight,
-        emb_src_tgt_weight_sharing=opt.embs_share_weight,
-        d_k=opt.d_k,
-        d_v=opt.d_v,
-        d_model=opt.d_model,
-        d_word_vec=opt.d_word_vec,
-        d_inner=opt.d_inner_hid,
-        n_layers=opt.n_layers,
-        n_head=opt.n_head,
-        dropout=opt.dropout).to(device)
-
-    optimizer = ScheduledOptim(
-        optim.Adam(
-            filter(lambda x: x.requires_grad, transformer.parameters()),
-            betas=(0.9, 0.98), eps=1e-09),
-        opt.d_model, opt.n_warmup_steps)
-
-    train(transformer, training_data, validation_data, optimizer, device ,opt)
-
-
-def prepare_dataloaders(data, opt):
-    # ========= Preparing DataLoader =========#
-    train_loader = torch.utils.data.DataLoader(
-        TranslationDataset(
-            src_word2idx=data['dict']['src'],
-            tgt_word2idx=data['dict']['tgt'],
-            src_insts=data['train']['src'],
-            tgt_insts=data['train']['tgt']),
-        num_workers=2,
-        batch_size=opt.batch_size,
-        collate_fn=paired_collate_fn,
-        shuffle=True)
-
-    valid_loader = torch.utils.data.DataLoader(
-        TranslationDataset(
-            src_word2idx=data['dict']['src'],
-            tgt_word2idx=data['dict']['tgt'],
-            src_insts=data['valid']['src'],
-            tgt_insts=data['valid']['tgt']),
-        num_workers=2,
-        batch_size=opt.batch_size,
-        collate_fn=paired_collate_fn)
-    return train_loader, valid_loader
-
-
-if __name__ == '__main__':
-    main()
+    main(args)
