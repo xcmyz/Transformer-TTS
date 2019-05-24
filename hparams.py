@@ -19,13 +19,13 @@ text_cleaners = ['english_cleaners']
 outputs_per_step = 1
 
 # Train
-batch_size = 2
+batch_size = 32
 epochs = 10000
 dataset_path = "dataset"
 learning_rate = 1e-3
 checkpoint_path = "./model_new"
 grad_clip_thresh = 1.0
-decay_step = [200000, 500000, 1000000]
-save_step = 1200
+decay_step = [20000, 50000, 100000]
+save_step = 2000
 log_step = 5
 clear_Time = 20
