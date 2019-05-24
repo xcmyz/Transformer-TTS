@@ -26,6 +26,6 @@ learning_rate = 1e-3
 checkpoint_path = "./model_new"
 grad_clip_thresh = 1.0
 decay_step = [20000, 50000, 100000]
-save_step = 200
+save_step = 1200
 log_step = 5
 clear_Time = 20
