@@ -6,8 +6,8 @@ Follow [Neural Speech Synthesis with Transformer Network](https://arxiv.org/abs/
 Follow [The Implementation of Transformer based on Pytorch](https://github.com/jadore801120/attention-is-all-you-need-pytorch)
 
 Model shown as follow:
-<div align="left">
-<img src="paper/model.png" width="500px" heigth="100px">
+<div align="center">
+<img src="paper/model.png" width="600px" heigth="100px">
 </div>
 
 ## Train
