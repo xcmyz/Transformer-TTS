@@ -2,10 +2,13 @@ import torch
 import torch.nn as nn
 import numpy as np
 import os
+import matplotlib
+import matplotlib.pyplot as plt
 
 from network import Model
 import hyperparams as hp
 from text import text_to_sequence
+import Audio
 
 device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
 
@@ -38,17 +41,21 @@ def synthesis(text, model):
     mel_input = torch.zeros([1, 1, 80]).float().to(device)
     pos_text = torch.arange(1, text.size(1)+1).unsqueeze(0).to(device)
 
-    for _ in range(1000):
-        pos_mel = torch.arange(1, mel_input.size(1)+1).unsqueeze(0).to(device)
-        _, mel_postnet, _, stop_token, _, _ = model(
-            text, mel_input, pos_text, pos_mel)
-        if stop_token[0] > 0.5:
-            break
-        mel_input = torch.cat([mel_input, mel_postnet[:, -1:, :]], dim=1)
+    with torch.no_grad():
+        for _ in range(1000):
+            pos_mel = torch.arange(
+                1, mel_input.size(1)+1).unsqueeze(0).to(device)
+            _, mel_postnet, _, stop_token, _, _ = model(
+                text, mel_input, pos_text, pos_mel)
+            if stop_token[0][-1][0].data > 0.5:
+                break
+            mel_input = torch.cat([mel_input, mel_postnet[:, -1:, :]], dim=1)
     print(mel_postnet.size())
+
+    Audio.tools.inv_mel_spec(mel_postnet.transpose(1, 2), "result.wav")
 
 
 if __name__ == "__main__":
     # Test
-    model = get_model(2000)
+    model = get_model(6000)
     synthesis("I am very happy to see you again.", model)
