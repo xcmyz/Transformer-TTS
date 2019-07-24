@@ -1,0 +1,14 @@
+num_mels = 80
+outputs_per_step = 1
+hidden_size = 256
+embedding_size = 512
+epochs = 10000
+lr = 0.001
+save_step = 2000
+batch_size = 16
+cleaners = ['english_cleaners']
+data_path = './dataset'
+checkpoint_path = './model_new'
+logger_path = "./logger"
+log_step = 10
+clear_Time = 20

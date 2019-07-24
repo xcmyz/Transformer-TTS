@@ -1,19 +1,17 @@
 import torch
 from torch.utils.data import Dataset, DataLoader
-from text import text_to_sequence
-import hparams
-
 import numpy as np
 from multiprocessing import cpu_count
 import os
 
-device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+import hyperparams as hp
+from text import text_to_sequence
 
 
-class TransformerTTSDataLoader(Dataset):
+class TransformerTTSDataset(Dataset):
     """ LJSpeech """
 
-    def __init__(self, dataset_path=hparams.dataset_path):
+    def __init__(self, dataset_path=hp.data_path):
         self.dataset_path = dataset_path
         self.text_path = os.path.join(self.dataset_path, "train.txt")
         self.text = process_text(self.text_path)
@@ -25,46 +23,38 @@ class TransformerTTSDataLoader(Dataset):
         index = idx + 1
         mel_name = os.path.join(
             self.dataset_path, "ljspeech-mel-%05d.npy" % index)
-        mel_np = np.load(mel_name)
+        mel_target = np.load(mel_name)
+        mel_input = np.concatenate(
+            [np.zeros([1, hp.num_mels], np.float32), mel_target[:-1, :]], axis=0)
 
         character = self.text[idx]
-        character = text_to_sequence(character, hparams.text_cleaners)
+        character = text_to_sequence(character, hp.cleaners)
         character = np.array(character)
 
-        return {"text": character, "mel": mel_np}
+        return {"text": character, "mel_target": mel_target, "mel_input": mel_input}
 
 
 def process_text(train_text_path):
     with open(train_text_path, "r", encoding="utf-8") as f:
-        inx = 0
         txt = []
         for line in f.readlines():
-            cnt = 0
-            for index, ele in enumerate(line):
-                if ele == '|':
-                    cnt = cnt + 1
-                    if cnt == 2:
-                        inx = index
-                        end = len(line)
-                        # print(line)
-                        txt.append(line[inx+1:end-1])
-                        break
+            txt.append(line)
+
         return txt
 
 
 def collate_fn(batch):
     texts = [d['text'] for d in batch]
-    mels = [d['mel'] for d in batch]
+    mel_targets = [d['mel_target'] for d in batch]
+    mel_inputs = [d['mel_input'] for d in batch]
 
-    texts, pos_padded = pad_text(texts)
-    mels, gate_target, tgt_sep, tgt_pos = pad_mel(mels)
+    texts, pos_text = pad_text(texts)
+    mel_inputs, pos_mel = pad_mel(mel_inputs)
+    mel_targets, _ = pad_mel(mel_targets)
 
-    # print(np.shape(mels))
-    # print(np.shape(gate_target))
-    # print(np.shape(tgt_sep))
-    # print(np.shape(tgt_pos))
-
-    return {"texts": texts, "pos_padded": pos_padded, "tgt_sep": tgt_sep, "tgt_pos": tgt_pos, "mels": mels, "gate_target": gate_target}
+    out = {"texts": texts, "pos_text": pos_text, "mel_target": mel_targets,
+           "pos_mel": pos_mel, "mel_input": mel_inputs}
+    return out
 
 
 def pad_text(inputs):
@@ -95,58 +85,22 @@ def pad_mel(inputs):
         s = np.shape(x)[1]
         x = np.pad(x, (0, max_len - np.shape(x)
                        [0]), mode='constant', constant_values=0)
+        pos_padded = np.pad(np.array([(i+1) for i in range(np.shape(x)[0])]),
+                            (0, max_len - x.shape[0]), mode='constant', constant_values=pad)
 
-        return x[:, :s]
+        return x[:, :s], pos_padded
 
     max_len = max(np.shape(x)[0] for x in inputs)
+    mel_output = np.stack([pad(x, max_len)[0] for x in inputs])
+    pos_padded = np.stack([pad(x, max_len)[1] for x in inputs])
 
-    def gen_gate(batchlen, maxlen):
-        list_A = [0 for i in range(batch_len - 1)]
-        list_B = [1 for i in range(max_len - batch_len + 1)]
-
-        output = list_A + list_B
-        output = np.array(output)
-
-        return output
-
-    gate_target = list()
-
-    for batch in inputs:
-        batch_len = np.shape(batch)[0]
-        gate_target.append(gen_gate(batch_len, max_len))
-
-    gate_target = np.stack(gate_target)
-
-    mel_output = np.stack([pad(x, max_len) for x in inputs])
-
-    # Get tgt_sep tgt_pos
-    batch_len = list()
-    for batch_ind in range(np.shape(gate_target)[0]):
-        cnt = 0
-        for ele in gate_target[batch_ind]:
-            if ele == 1:
-                cnt = cnt + 1
-        # print(cnt)
-        batch_len.append(cnt)
-
-    tgt_sep = np.zeros(np.shape(gate_target))
-    tgt_pos = np.zeros(np.shape(gate_target))
-
-    for i in range(np.shape(gate_target)[0]):
-        for j in range(np.shape(gate_target)[1] - batch_len[i]+1):
-            tgt_sep[i][j] = 1
-            tgt_pos[i][j] = j + 1
-
-    return mel_output, gate_target, tgt_sep, tgt_pos
+    return mel_output, pos_padded
 
 
 if __name__ == "__main__":
     # Test
-    dataset = TransformerTTSDataLoader()
-    training_loader = DataLoader(
-        dataset, batch_size=2, shuffle=True, collate_fn=collate_fn, drop_last=True, num_workers=1)
-
-    for i, data in enumerate(training_loader):
-        # Test
-        print(data["tgt_sep"])
-        print(data["tgt_pos"])
+    test_dataset = TransformerTTSDataset()
+    test_loader = DataLoader(test_dataset, batch_size=1,
+                             collate_fn=collate_fn, drop_last=True, num_workers=1)
+    for i, batch in enumerate(test_loader):
+        print(i)

@@ -1,7 +1,10 @@
-""" from https://github.com/keithito/tacotron """
+#-*- coding: utf-8 -*-
+
 import re
 from text import cleaners
 from text.symbols import symbols
+
+
 
 
 # Mappings from symbol to numeric ID and vice versa:
@@ -30,7 +33,6 @@ def text_to_sequence(text, cleaner_names):
   # Check for curly braces and treat their contents as ARPAbet:
   while len(text):
     m = _curly_re.match(text)
-    # print(m)
     if not m:
       sequence += _symbols_to_sequence(_clean_text(text, cleaner_names))
       break
@@ -38,6 +40,8 @@ def text_to_sequence(text, cleaner_names):
     sequence += _arpabet_to_sequence(m.group(2))
     text = m.group(3)
 
+  # Append EOS token
+  sequence.append(_symbol_to_id['~'])
   return sequence
 
 
